@@ -1,0 +1,524 @@
+---
+title: "Diet Optimization Analysis"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+
+
+# INTRO
+
+This project directory contains code and data for a Meal Plan Optimization project. 
+
+The premise of this project: Create a linear program that reccomends amounts of foods to eat for n number of consecutive days (7 days, for example). The program can take various objective functions, for example, minimize carbs, sodium and/or cholesterol. The meals must meet all nutritional requirements as prescribed by The Institue of Medicine (IOM). 
+
+# FORMULATION
+
+Minimize the amount of a given nutrient or set of nutrients, e.g., carbohydrates, present in daily meals subject to upper and lower bounds on various nutritional constraints as prescribed by the IOM. Constraints include upper and lower bounds on daily intake of calories, vitamins, minerals, etc. 
+
+```{r label, out.width = "100%", fig.cap = "Formulation"}
+knitr::include_graphics("Formulation.png")
+```
+
+# DATA:
+- NUTRIENT REQUIREMENT DATA form [wikipedia](https://en.wikipedia.org/wiki/Dietary_Reference_Intake)
+- COMMON NUTRIENT COUNTS IN FOODS from [USDA](https://www.ars.usda.gov/northeast-area/beltsville-md-bhnrc/beltsville-human-nutrition-research-center/nutrient-data-laboratory/docs/sr28-download-files/)
+- *Note* the values of the nutriets (in the columns) are per 100g of the food item listed. For example "BUTTER, WITH SALT" has 15.87 g of water per 100 g of Butter with Salt 
+
+
+
+# EXAMPLE 1) 7-DAY DIET PLAN. LOW CARB
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lpSolve)
+})
+```
+
+## Raw data
+
+```{r}
+raw_nutriet_data <- suppressMessages(read_csv("data/Nutrient Data.csv"))
+message("Number of food items in raw nutriets data: ",scales::comma(nrow(raw_nutriet_data)))
+```
+
+```{r}
+message("Number of nutriets in raw nutriets data: ",scales::comma(length(raw_nutriet_data)-2))
+```
+
+```{r}
+raw_constraints <- suppressMessages(read_csv('data/nutrient-constraints.csv') %>% select(`Original Nutrient Name`:Unit))
+message("Number of constraints in raw constraints data: ",scales::comma(nrow(raw_constraints)))
+```
+
+
+## Model Data
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+nutriets <- read_csv("data/nutrient-categories.csv")
+constraints <- read_csv("data/nutrient-constraints.csv") %>% select(`Original Nutrient Name`:Unit)
+```
+
+```{r}
+message("Number of food items in processed food data: ",scales::comma(nrow(nutriets)))
+```
+
+
+## Processing
+
+```{r}
+# keep only the cross-section of both lists
+keep_names <- inner_join(data_frame(names = names(nutriets))
+                         , data_frame(names = constraints$`Nutrient Name`)
+                         , by = "names") %>% unlist() %>% as.character()
+
+nutriets <- nutriets %>% select_if(names(.) %in% c("Category",keep_names))
+constraints <- constraints %>% filter(`Nutrient Name` %in% keep_names)
+
+
+# data cleansing -----------------------------------------------------------
+
+# manually adding an upper caloric limit of 2,500 kcals
+# 2,000 is RDI for women, 2,500 is for men
+constraints <- constraints %>% 
+  mutate(`Upper Bound` = ifelse(`Nutrient Name`=="Energ_Kcal", 2500,`Upper Bound`))
+
+# if there is no upper bound, then adding UL as lower bound X2
+constraints <- constraints %>% 
+  mutate(`Upper Bound` = ifelse(`Upper Bound`<`Lower Bound`, `Lower Bound`*2, `Upper Bound`))
+
+
+# Remove duplicate nutirents and oddities
+nutriets <- nutriets %>% 
+  filter(!Category %in% c("EGGS","NUTRITIONAL SUPP FOR PEOPLE W/ DIABETES"
+                          , "INF FORMULA. MEAD JOHNSON"
+                          ,"SHAKE", "SOY SAU", "GUMS", "SHORTENING CONFECTIONERY"
+                          , "TOPPING", "MUSHROOM", "WORTHINGTON STRIPPLES"
+                          , "MARGARINE-LIKE SHORTENING", "BREAKFAST BAR", "FST FOODS"
+                          , "PAPA JOHN'S 14\" CHS PIZZA", "EGG MIX", "JEW'S EAR"
+                          , "INF FOR","BEVERAGE", "SUNFLOWER SD BUTTER","SIDE DISHES"
+                          , "CISCO", "INF FORMULA")
+  ) %>% 
+  filter(!grepl(c("BUTTER|OIL|MARGARINE|FAT|LARD"),Category, ignore.case = TRUE))
+
+# nutrients are all amount per 100 grams of food, so convert to per 1 gram
+nutriets <- nutriets %>% mutate_at(vars(`Water_(g)`:`Vit_A_(g)`), funs(./100))
+```
+
+## View of model data after processing
+
+### Constraints:
+```{r}
+knitr::kable(constraints)
+```
+
+### Sample of food items (decision variables)
+```{r}
+set.seed(1)
+knitr::kable(head(sample_frac(nutriets, 1)))
+```
+
+
+## Run the LP in a loop for n number of days for LOW CARB DIET
+
+```{r}
+
+# how many days should we plan? (each day is a loop iteration)
+all_days <- 7
+
+
+foods_used <- c("WATER")
+all_results <- list()
+
+for(day in 1:all_days){
+  # day <- 1
+  
+  # for development purposes, sample the nutrients list. Set to 1 to use full list
+  sample_size <- 1
+  set.seed(1)
+  sample_nutriets <- sample_frac(nutriets, sample_size)
+  
+  # remove foods that have already been used, other than water
+  foods_used <- foods_used[foods_used!="WATER"]
+  sample_nutriets <- sample_nutriets %>% filter(!Category %in% foods_used)
+  
+  # set objective: minimize carbohydrates
+  objective_function <- sample_nutriets$`Carbohydrt_(g)`
+  
+  # initiate LHS constraint matrix
+  Left_Hand_Side <- matrix(numeric(nrow(sample_nutriets)), nrow = 1)
+  
+  # for each constraint, create a row in the LHS matrix
+  for(i in 1:nrow(constraints)){
+    
+    contraint_row <- constraints[i,]
+    constraint_name <- contraint_row$`Nutrient Name`
+    constraint_lower <- contraint_row$`Lower Bound`
+    constraint_upper <- contraint_row$`Upper Bound`
+    
+    nutirent_column <- sample_nutriets %>% 
+      select_at(vars(constraint_name)) %>% 
+      unlist() %>% as.numeric() %>% 
+      matrix(nrow = 1)
+    
+    rownames(nutirent_column) <- constraint_name
+    Left_Hand_Side <- rbind(Left_Hand_Side, nutirent_column)
+  }
+  
+  # remove the initialization row at the top
+  Left_Hand_Side <- Left_Hand_Side[2:nrow(Left_Hand_Side),]
+  
+  # direction of the constraints. Half are lower bounds half are upper bounds
+  constraint_directions <- c(rep(">=", nrow(Left_Hand_Side))
+                             ,rep("<=", nrow(Left_Hand_Side))
+  )
+  
+  # Lower and Upper bounds for RHS
+  Right_Hand_Side <- c(constraints$`Lower Bound`
+                       , constraints$`Upper Bound`)
+  
+  # duplicate the LHS matrix since we have both upper and lower bounds
+  Left_Hand_Side_Lower <- Left_Hand_Side
+  rownames(Left_Hand_Side_Lower) <- paste0(rownames(Left_Hand_Side),"_Lower")
+  Left_Hand_Side_Upper <- Left_Hand_Side
+  rownames(Left_Hand_Side_Upper) <- paste0(rownames(Left_Hand_Side),"_Upper")
+  
+  Left_Hand_Side_all <- rbind(Left_Hand_Side_Lower, Left_Hand_Side_Upper)
+  
+  ## check the rows and columns match up:
+  # all_equal(nrow(Left_Hand_Side_all)
+  #           , length(Right_Hand_Side)
+  #           , length(constraint_directions)
+  # )
+  # 
+  # all_equal(length(objective_function), ncol(Left_Hand_Side_all))
+  #
+  
+  # run the sover
+  lp_time_start <- Sys.time()
+  (LP_Solved <- lp(direction = "min"
+                   , objective.in = objective_function
+                   , const.mat = Left_Hand_Side_all
+                   , const.dir = constraint_directions
+                   , const.rhs = Right_Hand_Side
+                   , presolve=0
+                   , compute.sens=TRUE
+                   , all.bin = FALSE
+                   #, binary.vec
+                   #, all.int=FALSE
+                   #, int.vec
+  ))
+  (lp_time <- Sys.time()-lp_time_start)
+  
+  
+  # record results
+  result_objective <- LP_Solved$objval
+  
+  # record non-zero decision variables
+  results <- data_frame(
+    Food = sample_nutriets$Category[LP_Solved$solution>0]
+    ,`Amount(g)` = LP_Solved$solution[LP_Solved$solution>0]
+  )
+  
+  results$Day <- as.integer(day)
+  
+  all_results[[day]] <- results
+  
+  # record foods used so they will be removed from subsequent loop
+  foods_used <- c(foods_used, results$Food)
+  
+  # display info
+  message("DAY ",day, ": ", length(results$Food)," items selected. "
+          ,scales::percent(sample_size), " of data used. LP completed in "
+          ,round(lp_time,2), units(lp_time))
+}
+
+```
+
+
+## View results
+
+All amounts are in grams per day. 
+
+**For reference:**
+
+- 1 cup = 320 grams
+- 1 liter = 1000 grams (for water)
+
+```{r paged.print=FALSE}
+# print results:
+max_len <- max(map_dbl(all_results, nrow))
+blank_rows <- data_frame(rownum = 1:max_len)
+
+all_results_print <- all_results %>% 
+  map(~.x %>% mutate(rownum = row_number())) %>% 
+  map(~full_join(.x, blank_rows, by = "rownum")) %>% 
+  map(~.x %>% select(-rownum)) %>% 
+  map(~{
+    nms <- names(.x)
+    dy <- unique(.x$Day)
+    dy <- dy[!is.na(dy)]
+    nm1 <- paste0("Day ",dy," food")
+    nm2 <- paste0("Day ",dy," amt(g)")
+    names(.x) <- c(nm1, nm2, "Day")
+    .x %>% select(-Day)
+  }) %>% 
+  bind_cols()
+
+knitr::kable(all_results_print[,1:6])
+```
+
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+knitr::kable(all_results_print[,7:14])
+```
+
+# EXAMPLE 2) 1-DAY, LOW SODIUM & LOW CHOLESTEROL & LOW CARB
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+
+# LOW SODIUM, CARBS AND CHOLESTEROL
+
+library(tidyverse)
+library(lpSolve)
+
+nutriets <- read_csv("data/nutrient-categories.csv")
+constraints <- read_csv("data/nutrient-constraints.csv") %>% select(`Original Nutrient Name`:Unit)
+
+# keep only the cross-section of both lists
+keep_names <- inner_join(data_frame(names = names(nutriets))
+                         , data_frame(names = constraints$`Nutrient Name`)
+                         , by = "names") %>% unlist() %>% as.character()
+
+nutriets <- nutriets %>% select_if(names(.) %in% c("Category",keep_names))
+constraints <- constraints %>% filter(`Nutrient Name` %in% keep_names)
+
+
+# data cleansing -----------------------------------------------------------
+
+# manually adding an upper caloric limit of 2,500 kcals
+# 2,000 is RDI for women, 2,500 is for men
+constraints <- constraints %>% 
+  mutate(`Upper Bound` = ifelse(`Nutrient Name`=="Energ_Kcal", 2500,`Upper Bound`))
+
+# if there is no upper bound, then adding UL as lower bound X2
+constraints <- constraints %>% 
+  mutate(`Upper Bound` = ifelse(`Upper Bound`<`Lower Bound`, `Lower Bound`*2, `Upper Bound`))
+
+
+# Remove duplicate nutirents and oddities
+nutriets <- nutriets %>% 
+  filter(!Category %in% c("EGGS","NUTRITIONAL SUPP FOR PEOPLE W/ DIABETES"
+                          , "INF FORMULA. MEAD JOHNSON"
+                          ,"SHAKE", "SOY SAU", "GUMS", "SHORTENING CONFECTIONERY"
+                          , "TOPPING", "MUSHROOM", "WORTHINGTON STRIPPLES"
+                          , "MARGARINE-LIKE SHORTENING", "BREAKFAST BAR", "FST FOODS"
+                          , "PAPA JOHN'S 14\" CHS PIZZA", "EGG MIX", "JEW'S EAR"
+                          , "INF FOR","BEVERAGE", "SUNFLOWER SD BUTTER","SIDE DISHES"
+                          , "CISCO", "INF FORMULA","BEVERAG","TODDL FORM","SHORTENING FRYING (HVY DUTY)"
+                          , "SHORTENING INDUSTRIAL")
+  ) %>% 
+  filter(!grepl(c("BUTTER|OIL|MARGARINE|FAT|LARD"),Category, ignore.case = TRUE))
+
+# nutrients are in grams of nutrient per 100g of food, so reducing to nutrients per 1 gram of food
+nutriets <- nutriets %>% mutate_at(vars(`Water_(g)`:`Vit_A_(g)`), funs(./100))
+
+# Run the LP --------------------------------------------------------------
+
+# how many days to plan? (will loop over)
+all_days <- 1
+
+
+foods_used <- c("WATER") # list of foods already used (water is a placeholder)
+all_results <- list() # store the meal plans
+keep_LPs <- list() # store the LP results
+for(day in 1:all_days){
+  # day <- 1
+  
+  # for development purposes, sample the nutrients list. 
+  sample_size <- 1
+  set.seed(1)
+  sample_nutriets <- sample_frac(nutriets, sample_size)
+  
+  # remove foods that have already been used other than water
+  foods_used <- foods_used[foods_used!="WATER"]
+  sample_nutriets <- sample_nutriets %>% filter(!Category %in% foods_used)
+  
+  # set objective: minimize carbohydrates
+  objective_function <- sample_nutriets$`Sodium_(g)`+sample_nutriets$`Carbohydrt_(g)`+sample_nutriets$`Cholestrl_(g)` #OBJECTIVE FUNCTION
+  
+  # initiate LHS matrix
+  Left_Hand_Side <- matrix(numeric(nrow(sample_nutriets)), nrow = 1)
+  
+  # for each constraint, create a row in the LHS matrix
+  for(i in 1:nrow(constraints)){
+    # i <- 1
+    contraint_row <- constraints[i,]
+    constraint_name <- contraint_row$`Nutrient Name`
+    constraint_lower <- contraint_row$`Lower Bound`
+    constraint_upper <- contraint_row$`Upper Bound`
+    
+    nutirent_column <- sample_nutriets %>% 
+      select_at(vars(constraint_name)) %>% 
+      unlist() %>% as.numeric() %>% 
+      matrix(nrow = 1)
+    
+    rownames(nutirent_column) <- constraint_name
+    Left_Hand_Side <- rbind(Left_Hand_Side, nutirent_column)
+  }
+  
+  # remove the initialization row at the top
+  Left_Hand_Side <- Left_Hand_Side[2:nrow(Left_Hand_Side),]
+  
+  # there are both lower and upper bounds on the constraints
+  constraint_directions <- c(rep(">=", nrow(Left_Hand_Side))
+                             ,rep("<=", nrow(Left_Hand_Side))
+  )
+  
+  # Lowe and Upper bounds for RHS
+  Right_Hand_Side <- c(constraints$`Lower Bound`
+                       , constraints$`Upper Bound`)
+  
+  # duplicate the LHS matrix since we have both upper and lower bounds
+  Left_Hand_Side_Lower <- Left_Hand_Side
+  rownames(Left_Hand_Side_Lower) <- paste0(rownames(Left_Hand_Side),"_Lower")
+  Left_Hand_Side_Upper <- Left_Hand_Side
+  rownames(Left_Hand_Side_Upper) <- paste0(rownames(Left_Hand_Side),"_Upper")
+  
+  Left_Hand_Side_all <- rbind(Left_Hand_Side_Lower, Left_Hand_Side_Upper)
+  
+  
+  LP_Solved <- lp(direction = "min"
+                  , objective.in = objective_function
+                  , const.mat = Left_Hand_Side_all
+                  , const.dir = constraint_directions
+                  , const.rhs = Right_Hand_Side
+                  , compute.sens=TRUE
+  )
+  
+  
+  # compute results
+  results <- data_frame(
+    Food = sample_nutriets$Category[LP_Solved$solution>0]
+    ,`Amount(g)` = LP_Solved$solution[LP_Solved$solution>0]
+  )
+  results$Day <- as.integer(day)
+  
+  # store results
+  keep_LPs[[day]] <- LP_Solved
+  all_results[[day]] <- results
+  foods_used <- c(foods_used, results$Food)
+  
+  message("DAY ",day, ": ", length(results$Food)," items selected. ",scales::percent(sample_size), " of data used. LP completed in ",round(lp_time,2), units(lp_time))
+}
+
+
+# print results:
+max_len <- max(map_dbl(all_results, nrow))
+blank_rows <- data_frame(rownum = 1:max_len)
+
+all_results_print <- all_results %>% 
+  map(~.x %>% mutate(rownum = row_number())) %>% 
+  map(~full_join(.x, blank_rows, by = "rownum")) %>% 
+  map(~.x %>% select(-rownum)) %>% 
+  map(~{
+    nms <- names(.x)
+    dy <- unique(.x$Day)
+    dy <- dy[!is.na(dy)]
+    nm1 <- paste0("Day ",dy," food")
+    nm2 <- paste0("Day ",dy," amt(g)")
+    names(.x) <- c(nm1, nm2, "Day")
+    .x %>% select(-Day)
+  }) %>% 
+  bind_cols()
+
+# sensitivity analysis ----------------------------------------------------
+
+# Question: In the event the constraints (i.e., the guidlines issued by IOM) are changed, how much 
+# can the RDI's change without alterting the meal plans?
+
+# objective functions 
+lp_analysis <- keep_LPs[[1]]
+
+# The dual price gives the improvement in the objective function if the constraint is relaxed by one unit
+# "Dual price", also known as Shadow Price
+
+# The shadow price for a constraint indicates the amount by which the 
+# objective function value changes given a unit increase in the RHS 
+# value of the constraint, assuming all other coefficients remain constant. 
+# If a shadow price is positive, a unit increase in the RHS value of the 
+# associated constraint results in an increase in the optimal objective function value.
+
+## Sensitivity Report
+# 1) Objective
+Objective_df <- data_frame(Name = "Minimization of Carbs, Sodium and Cholesterol"
+                           , final_value = lp_analysis$objval)
+
+# 2) variables
+
+variable_duals <- data_frame(variable = sample_nutriets$Category
+                             , final_value = lp_analysis$solution
+                             , objective_coeficiet = objective_function
+                             , allowable_increase = lp_analysis$sens.coef.to[(lp_analysis$const.count+1):length(lp_analysis$duals)]
+                             , allowable_decrease = lp_analysis$sens.coef.from[(lp_analysis$const.count+1):length(lp_analysis$duals)]
+) %>% 
+  mutate(Reduced_Cost = objective_coeficiet - lp_analysis$duals[(lp_analysis$const.count+1):length(lp_analysis$duals)]) %>% 
+  select(variable, final_value, Reduced_Cost, everything())
+
+variable_duals %>% filter(final_value>0)
+
+
+# 3) constraints
+final_nutrients <- 
+  sample_nutriets %>% 
+  mutate(solution = lp_analysis$solution) %>% 
+  mutate_at(vars(`Water_(g)`:`Vit_A_(g)`), funs(.*solution)) %>% 
+  filter(solution>0) %>% 
+  select(-solution, -Category) %>% 
+  summarise_all(sum) %>% 
+  gather(constraint, final_value)
+
+all_final_values <- bind_rows(
+  final_nutrients %>% mutate(constraint = paste0(constraint,"_Lower"))
+  , final_nutrients %>% mutate(constraint = paste0(constraint,"_Upper"))
+)
+
+Constraint_Sensitivity <- data_frame(constraint = colnames(lp_analysis$constraints)
+                                     , shadow_price = lp_analysis$duals[1:lp_analysis$const.count]
+                                     , constraint_RHS = Right_Hand_Side
+                                     , allowable_increase = lp_analysis$duals.to[1:lp_analysis$const.count]
+                                     , allowable_decrease = lp_analysis$duals.from[1:lp_analysis$const.count]
+) %>% 
+  left_join(all_final_values, by = "constraint") %>% 
+  select(constraint, final_value, everything())
+
+```
+## Results: Low Carb & Low Sodium & Low Cholesterol
+
+```{r}
+knitr::kable(all_results_print)
+```
+
+
+## Sensitivity Analysis
+
+### Objective Cell (Min)
+
+```{r}
+knitr::kable(Objective_df)
+```
+
+### Decision Variable Cells
+```{r}
+knitr::kable(variable_duals %>% filter(final_value>0))
+```
+
+
+### Constraints
+```{r}
+knitr::kable(Constraint_Sensitivity %>% filter(shadow_price>0))
+```
+
